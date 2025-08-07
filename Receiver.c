@@ -1,0 +1,631 @@
+/*
+ECE243 - Computer Organization
+Project/Receiver.c
+By: John Cameron & Michael Feng
+Last Modified: 2025/03/31
+*/
+
+// libraries
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+// system macros
+#define BOARD_ADDRESS 0x04
+#define TIMER_LOAD 10000000  // period*100000000
+#define GPIO_PIN_MASK 0b1    // selects the pin to read
+
+// tolerance macros
+#define BIT_COUNTER_TOLERANCE 10000
+#define START_COUNTER_TOLERANCE 100000
+#define NOMINAL_START_BIT_LENGTH 1350000
+#define NOMINAL_ZERO_LENGTH 113000
+#define NOMINAL_ONE_LENGTH 226000
+
+// graphics macros
+#define BMP_ROWS 20
+#define BMP_COLS 30
+#define DVD_WIDTH 53
+#define DVD_HEIGHT 23
+
+// sound macros
+#define TONE_LENGTH_PERIODS 100
+#define FIFO_WRITE_COUNT 5
+
+// function prototypes - defined below the main program
+static void interrupt_handler(void) __attribute__((interrupt("machine")));
+void interrupt_setup(void);
+void setup_expansion_ports(void);
+void set_and_start_timer(void);
+void gpio_ISR(void);
+unsigned int check_timer_snapshot(void);
+int validate(void);
+void execute(void);
+
+void plot_pixel(int x, int y, short int line_color);
+void swap_int(int* x, int* y);
+bool inRange(int, int, int);
+
+void wait_for_vsync(void);
+void clear_screen(void);
+void draw_dvd(int x0, int y0);
+
+void sound_for_collision(void);
+
+void collisionVolumeUp(void);
+void collisionVolumeDown(void);
+void moreRed(void);
+void lessRed(void);
+void moreBlue(void);
+void lessBlue(void);
+void moreGreen(void);
+void lessGreen(void);
+void toggleRun(void);
+
+// global variables - can be used or modified by any subroutine as needed
+volatile int* LED_ADDRESS = (int*)0xFF200000;
+volatile int* TIMER_BASE = (int*)0xFF202000;
+volatile int* EXPANSION_BASE = (int*)0xFF200070;  // JP2 expansion port
+volatile int RX_times[33] = {0};
+volatile unsigned int RX_data = 0;
+volatile int* AUDIO_BASE = (int*)0xFF203040;
+
+volatile short int currentColour =
+    0xFFFF;                       // holds the user's current colour preference
+volatile int pixel_buffer_start;  // global variable
+short int Buffer1[240][512];      // 240 rows, 512 (320 + padding) columns
+short int Buffer2[240][512];
+
+volatile unsigned int lowSoundValue = 0x0;
+volatile unsigned int highSoundValue = 0xFFFFF;
+volatile int dx, dx_prev, dy, dy_prev;
+
+short int epd_bitmap_DVD_logo[] = {
+    0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0x0000, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0x0000, 0xffff, 0xffff,
+    0xffff, 0xffff, 0x0000, 0x0000, 0x0000, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0x0000, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0x0000, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0x0000, 0x0000, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0x0000, 0x0000, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0x0000, 0x0000, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0x0000, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0x0000, 0x0000,
+    0x0000, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0x0000, 0x0000, 0x0000, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0x0000, 0x0000, 0x0000, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000,
+    0xffff, 0xffff, 0xffff, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0x0000, 0x0000,
+    0x0000, 0x0000, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0xffff, 0xffff, 0xffff, 0xffff, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0xffff, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0xffff, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0x0000, 0x0000, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+    0x0000, 0x0000, 0x0000, 0x0000};
+
+int main(void) {  // main loop: does the graphics work
+  *LED_ADDRESS = 0x0;
+  interrupt_setup();  // set up the interupts
+  setup_expansion_ports();
+
+  volatile int* pixel_ctrl_ptr = (int*)0xFF203020;
+
+  int positionX, positionY, lastX, lastY, lastlastX, lastlastY;
+  // initialize location and direction of logo
+  lastX = lastY = lastlastX = lastlastY = 0;
+  positionX = rand() % 320;
+  positionY = rand() % 240;
+  dx = dx_prev = (rand() % 2) * 2 - 1;
+  dy = dy_prev = (rand() % 2) * 2 - 1;
+  /* set front pixel buffer to Buffer 1 */
+
+  *(pixel_ctrl_ptr + 1) =
+      (int)&Buffer1;  // first store the address in the  back buffer
+  /* now, swap the front/back buffers, to set the front buffer location */
+  wait_for_vsync();
+  /* initialize a pointer to the pixel buffer, used by drawing functions */
+  pixel_buffer_start = *pixel_ctrl_ptr;
+  clear_screen();  // pixel_buffer_start points to the pixel buffer
+
+  /* set back pixel buffer to Buffer 2 */
+  *(pixel_ctrl_ptr + 1) = (int)&Buffer2;
+  pixel_buffer_start = *(pixel_ctrl_ptr + 1);  // we draw on the back buffer
+  clear_screen();  // pixel_buffer_start points to the pixel buffer
+
+  while (1) {
+    // erase dvd logo drawn from last iteration
+    for (int y = 0; y < DVD_HEIGHT; y++) {
+      for (int x = 0; x < DVD_WIDTH; x++) {
+        plot_pixel(x + lastlastX, y + lastlastY, 0x0000);
+      }
+    }
+
+    // code for drawing the boxes and lines
+    draw_dvd(positionX, positionY);
+
+    // code for updating the locations of boxes
+    lastlastX = lastX;
+    lastlastY = lastY;
+    lastX = positionX;
+    lastY = positionY;
+    if (!inRange(positionX, 1, 319 - DVD_WIDTH)) {
+      dx *= -1;
+      sound_for_collision();
+    }
+    if (!inRange(positionY, 1, 239 - DVD_HEIGHT)) {
+      dy *= -1;
+      sound_for_collision();
+    }
+    positionX += dx;
+    positionY += dy;
+
+    wait_for_vsync();  // swap front and back buffers on VGA vertical sync
+    pixel_buffer_start = *(pixel_ctrl_ptr + 1);  // new back buffer
+  }
+  return 0;
+}
+
+void interrupt_handler(void) {
+  int trap_cause_code;
+  __asm__ volatile(
+      "csrr %0, mcause"
+      : "=r"(trap_cause_code));  // check what interrupt line generated the trap
+  trap_cause_code = (trap_cause_code & 0x7FFFFFFF);  // isolte lower 31 bits
+  if (trap_cause_code == 28) {
+    gpio_ISR();  // trap caused by GPIO expansion port
+  } else {
+    while (1) {  // arrived here for no good reason - go into a infinite loop
+    }
+  }
+  return;
+}
+
+void interrupt_setup(void) {
+  int mstatus, mie, mtvec;         // values of the 3 important control & status registers
+  mstatus = 0b1000;  // selects the mie bit of mstatus register
+  __asm__ volatile(
+      "csrc mstatus, %0" ::"r"(mstatus));  // disable global interrupts
+  mtvec = (int)&interrupt_handler;         // get address of interrupt handler
+  __asm__ volatile("csrw mtvec, %0" ::"r"(
+      mtvec));  // write address of interrupt handler to mtvec register
+  __asm__ volatile("csrr %0, mie" : "=r"(mie));  // read the mie register
+  __asm__ volatile("csrs mie, %0" ::"r"(
+      mie));          // disable any IRQ line that is currently HIGH
+  mie = (0b1 << 28);  // 28th bit also HIGH (JP2 IRQ line)
+  __asm__ volatile("csrs mie, %0" ::"r"(mie));  // set the IRQ lines (28) HIGH
+  __asm__ volatile(
+      "csrs mstatus, %0" ::"r"(mstatus));  // finally, enable global interrupts
+  return;
+}
+
+void set_and_start_timer(void) {  // needs fixin
+  *TIMER_BASE = 0x0;
+  int start_value, control_register;
+  *(TIMER_BASE + 1) = 0b1000;  // stop the timer
+  start_value = (int)TIMER_LOAD;
+  *(TIMER_BASE + 2) = start_value;  // sets the lower 16 bits of the start value
+  start_value = (start_value >> 16);  // shift upper 16 bits to lower 16 bits
+  *(TIMER_BASE + 3) = start_value;  // sets the upper 16 bits of the start value
+  control_register = 0b100;         // sets START, no CONT or ITO
+  *(TIMER_BASE + 1) = control_register;  // start the timer
+  return;
+}
+
+void setup_expansion_ports(void) {
+  *(EXPANSION_BASE + 1) = 0x0;  // set all bits as inputs
+  *(EXPANSION_BASE + 2) =
+      (int)GPIO_PIN_MASK;              // enable interrupts for all pins D0
+  *(EXPANSION_BASE + 3) = 0xFFFFFFFF;  // clear all edges
+}
+
+void gpio_ISR(void) {
+  volatile unsigned int GPIO_data, initial_time, final_time, validity;
+  *(EXPANSION_BASE + 3) = *(EXPANSION_BASE + 3);  // reset edges
+  GPIO_data =
+      *EXPANSION_BASE & (int)GPIO_PIN_MASK;  // check what the logic value of
+                                             // the leading pulse is...
+  if (GPIO_data != 0) {
+    return;  // if not logic 0, invalid, return!
+  }
+  set_and_start_timer();  // set and start timer
+  while (*(EXPANSION_BASE + 3) == 0) {
+    if ((*TIMER_BASE & 0b1) != 0) {  // want to check whether the timer expired,
+                                     // meaning transmission timer
+      return;
+    }
+  }
+  final_time = check_timer_snapshot();
+  *(EXPANSION_BASE + 3) = *(EXPANSION_BASE + 3);  // reset edges
+  RX_times[0] = ((int)TIMER_LOAD - (int)final_time);
+
+  for (int idx = 1; idx < 33; idx++) {
+    initial_time = final_time;
+    while (*(EXPANSION_BASE + 3) == 0) {
+      if ((*TIMER_BASE & 0b1) != 0) {  // want to check whether the timer
+                                       // expired, meaning transmission timer
+        return;
+      }
+    }
+    final_time = check_timer_snapshot();
+    *(EXPANSION_BASE + 3) = *(EXPANSION_BASE + 3);  // reset edges
+    RX_times[idx] = ((int)initial_time - (int)final_time);
+  }
+  *(TIMER_BASE + 1) = 0b1000;  // stop timer
+  *TIMER_BASE = 0x0;           // clear TO
+
+  validity = validate();
+
+  if (validity == 1) {
+    *LED_ADDRESS = 0b1111111110; // valid code
+    //printf("%x\n", RX_data); // prints data to terminal
+    execute(); // transfer control to a execute routine
+  } else {
+    *LED_ADDRESS = 0b1; // invalid code
+  }
+
+  return;
+}
+
+unsigned int check_timer_snapshot(void) {
+  //*(TIMER_BASE + 1) = 0b1000;
+  *(TIMER_BASE + 4) = 0xdeadbeef;  // dummy write
+  unsigned int snapshot;
+  snapshot = *(TIMER_BASE + 5);  // read upper snapshot bits
+  snapshot = (snapshot << 16);   // make room for lower bits
+  snapshot |= (*(TIMER_BASE + 4) & 0x0000FFFF);
+  //*(TIMER_BASE + 1)
+  return snapshot;
+}
+
+int validate(void) {
+  if ((RX_times[0] <
+       ((int)NOMINAL_START_BIT_LENGTH - (int)START_COUNTER_TOLERANCE)) ||
+      (RX_times[0] >
+       ((int)NOMINAL_START_BIT_LENGTH +
+        (int)START_COUNTER_TOLERANCE))) {  // check if start bit is outside the
+                                           // tolerances
+    return 0;                              // the transmission must be invalid
+  }
+  for (int idx = 32; idx > 0; idx--) {
+    if ((RX_times[idx] >=
+         ((int)NOMINAL_ZERO_LENGTH - (int)BIT_COUNTER_TOLERANCE)) &&
+        (RX_times[idx] <=
+         ((int)NOMINAL_ZERO_LENGTH + (int)BIT_COUNTER_TOLERANCE))) {
+      RX_data = (RX_data << 1);  // have confirmed the transmitted bit to be a 0
+    } else if ((RX_times[idx] >=
+                ((int)NOMINAL_ONE_LENGTH - (int)BIT_COUNTER_TOLERANCE)) &&
+               (RX_times[idx] <=
+                ((int)NOMINAL_ONE_LENGTH + (int)BIT_COUNTER_TOLERANCE))) {
+      RX_data = (RX_data << 1);
+      RX_data =
+          (RX_data |
+           0b1);  // have confirmed the transmitted bit to be a 1, so append a 1
+    } else {      // found 1 bit to be invalid, must return 0 indicating error
+      RX_data = 0;
+      return 0;
+    }
+  }
+  return 1;
+}
+
+void plot_pixel(int x, int y, short int line_color) {
+  volatile short int* one_pixel_address;
+
+  one_pixel_address = pixel_buffer_start + (y << 10) + (x << 1);
+
+  *one_pixel_address = line_color;
+  return;
+}
+
+void wait_for_vsync(void) {
+  volatile int* Fbuf = (int*)0xFF203020;
+  *Fbuf = 1;
+  int status;
+  status = (*(Fbuf + 3) & 1);
+  while (status != 0) {
+    status = (*(Fbuf + 3) & 1);
+  }
+  return;
+}
+
+void clear_screen(void) {
+  for (int Y = 0; Y <= 239; Y++) {
+    for (int X = 0; X <= 319; X++) {
+      plot_pixel(X, Y, 0);
+    }
+  }
+  return;
+}
+
+void sound_for_collision(void) {
+  int FIFOspace;
+  for (int i = 0; (i < (int)TONE_LENGTH_PERIODS); i++) {
+    FIFOspace = *(AUDIO_BASE + 1);
+    FIFOspace = (FIFOspace >> 24);
+    FIFOspace = (FIFOspace & 0xFF);
+    if (FIFOspace >= (2 * (int)FIFO_WRITE_COUNT)) {
+      for (int i = (int)FIFO_WRITE_COUNT; i > 0; i--) {
+        *(AUDIO_BASE + 2) = highSoundValue;
+        *(AUDIO_BASE + 3) = highSoundValue;
+      }
+      for (int j = (int)FIFO_WRITE_COUNT; j > 0; j--) {
+        *(AUDIO_BASE + 2) = lowSoundValue;
+        *(AUDIO_BASE + 3) = lowSoundValue;
+      }
+    }
+  }
+  return;
+}
+
+void swap_int(int* x, int* y) {
+  int temp = *x;
+  *x = *y;
+  *y = temp;
+}
+
+void draw_dvd(int x0, int y0) {
+
+  for (int y = 0; y < DVD_HEIGHT; y++) {
+    for (int x = 0; x < DVD_WIDTH; x++) {
+      if(epd_bitmap_DVD_logo[y * DVD_WIDTH + x] != 0x0000){
+        plot_pixel(x + x0, y + y0, currentColour);
+      } else {
+        plot_pixel(x + x0, y + y0, epd_bitmap_DVD_logo[y * DVD_WIDTH + x]);
+      }
+    }
+  }
+}
+
+bool inRange(int num, int low, int high) { return num >= low && num <= high; }
+
+void execute(void) {
+  if ((RX_data & 0xFF) == (int)BOARD_ADDRESS) {
+    char command = ((RX_data & 0xFF0000) >> 16);
+    if(command & 0xF0){
+      if(command & 0b1000){
+        //increase colour
+        if(command & 0b100) moreRed();
+        if(command & 0b010) moreGreen();
+        if(command & 0b001) moreBlue();
+      } else {
+        //decrease colour
+        if(command & 0b100) lessRed();
+        if(command & 0b010) lessGreen();
+        if(command & 0b001) lessBlue();
+      }
+    } else {
+      switch (command) {
+        case 0x02:
+          collisionVolumeUp();
+          break;
+        case 0x03:
+          collisionVolumeDown();
+          break;
+        case 0x04: toggleRun();
+          break;
+        default: break;
+      }
+    }
+
+  }
+  return;
+}
+
+void collisionVolumeDown(void) {
+  if (highSoundValue > 0b1) {
+    highSoundValue = (highSoundValue >> 1);
+  }
+  return;
+}
+
+void collisionVolumeUp(void) {
+  if (highSoundValue < 0x7FFFFFFF) {
+    highSoundValue = (highSoundValue << 1);
+    highSoundValue = (highSoundValue | 0b1);
+  }
+  return;
+}
+
+void moreRed(void) {
+  short int helper;
+  helper = (currentColour & 0xF800);
+  helper = (helper >> 11);
+  if (helper < 0x1F) {
+    helper = (helper << 1);
+    helper = (helper | 0b1);
+  }
+  helper = (helper << 11);
+  currentColour = (currentColour & ~0xF800);
+  currentColour = (currentColour | helper);
+  return;
+}
+
+void lessRed(void) {
+  unsigned short int helper;
+  helper = (currentColour & (unsigned short int)0xF800);
+  helper = (helper >> 11);
+  if (helper > 0x0) {
+    helper = (helper >> 1);
+  }
+  helper = (helper << 11);
+  currentColour = (currentColour & ~(unsigned short int)0xF800);
+  currentColour = (currentColour | helper);
+  return;
+}
+
+void moreBlue(void) {
+  short int helper;
+  helper = (currentColour & 0x1F);
+  if (helper < 0x1F) {
+    helper = (helper << 1);
+    helper = (helper | 0b1);
+  }
+  currentColour = (currentColour & ~0x1F);
+  currentColour = (currentColour | helper);
+  return;
+}
+
+void lessBlue(void) {
+  short int helper;
+  helper = (currentColour & 0x1F);
+  if (helper > 0x0) {
+    helper = (helper >> 1);
+  }
+  currentColour = (currentColour & ~0x1F);
+  currentColour = (currentColour | helper);
+  return;
+}
+
+void moreGreen(void) {
+  short int helper;
+  helper = (currentColour & 0x7E0);
+  helper = (helper >> 5);
+  if (helper < 0x3F) {
+    helper = (helper << 1);
+    helper = (helper | 0b1);
+  }
+  helper = (helper << 5);
+  currentColour = (currentColour & ~0x7E0);
+  currentColour = (currentColour | helper);
+  return;
+}
+
+void lessGreen(void) {
+  short int helper;
+  helper = (currentColour & 0x7E0);
+  helper = (helper >> 5);
+  if (helper > 0x0) {
+    helper = (helper >> 1);
+  }
+  helper = (helper << 5);
+  currentColour = (currentColour & ~0x7E0);
+  currentColour = (currentColour | helper);
+  return;
+}
+
+void toggleRun(void) {
+  if ((dx == 0) && (dy == 0)) { // program currently paused
+    dx = dx_prev;
+    dy = dy_prev;
+  } else { // currently running
+    dx_prev = dx;
+    dy_prev = dy;
+    dx = dy = 0;
+  }
+  return;
+}
